@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import hashlib
+import threading
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -9,51 +10,90 @@ from aiogram.types import (
     LabeledPrice, PreCheckoutQuery
 )
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiosqlite import connect as aconnect
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
+# === HEALTH CHECK (внешний будильник) ===
+from aiohttp import web
+
+async def health_check(request):
+    return web.Response(text="OK", content_type="text/plain")
+
+def start_health_server():
+    async def run_server():
+        app = web.Application()
+        app.router.add_get('/health', health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.getenv("PORT", 10000))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        await asyncio.Event().wait()  # keep alive
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_server())
+
+# Запускаем health server в отдельном потоке
+threading.Thread(target=start_health_server, daemon=True).start()
+
+# === ОСНОВНОЙ КОД ===
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is required")
 
 # === DATABASE ===
-DB_PATH = "/tmp/luminary.db"
+import asyncpg
 
 async def init_db():
-    async with aconnect(DB_PATH) as db:
-        await db.execute("""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 username TEXT,
                 soft_name TEXT,
-                agreed BOOLEAN DEFAULT 0,
-                subscribed BOOLEAN DEFAULT 0,
-                subscription_until TEXT,
-                last_entry TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                agreed BOOLEAN DEFAULT FALSE,
+                subscribed BOOLEAN DEFAULT FALSE,
+                subscription_until TIMESTAMP,
+                last_entry TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER REFERENCES users(user_id) ON DELETE CASCADE,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
                 text TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
                 entry_type TEXT DEFAULT 'free'
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_affirmations (
-                user_id INTEGER,
+                user_id BIGINT,
                 affirmation_hash TEXT,
-                sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+                sent_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        await db.commit()
+    finally:
+        await conn.close()
+
+async def execute_query(query, *params):
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        if query.strip().upper().startswith("SELECT"):
+            return await conn.fetch(query, *params)
+        else:
+            await conn.execute(query, *params)
+    finally:
+        await conn.close()
 
 # === AFFIRMATIONS ===
 OPENINGS = [
@@ -117,31 +157,27 @@ def generate_affirmation():
 
 async def get_unique_affirmation(user_id: int):
     since = datetime.utcnow() - timedelta(days=180)
-    async with aconnect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT affirmation_hash FROM sent_affirmations WHERE user_id = ? AND sent_at > ?",
-            (user_id, since.isoformat())
-        )
-        rows = await cursor.fetchall()
-        used_hashes = {row[0] for row in rows}
-        
-        for _ in range(15):
-            text, hash_ = generate_affirmation()
-            if hash_ not in used_hashes:
-                await db.execute(
-                    "INSERT INTO sent_affirmations (user_id, affirmation_hash, sent_at) VALUES (?, ?, ?)",
-                    (user_id, hash_, datetime.utcnow().isoformat())
-                )
-                await db.commit()
-                return text
-        
+    rows = await execute_query(
+        "SELECT affirmation_hash FROM sent_affirmations WHERE user_id = $1 AND sent_at > $2",
+        user_id, since
+    )
+    used_hashes = {row["affirmation_hash"] for row in rows}
+    
+    for _ in range(15):
         text, hash_ = generate_affirmation()
-        await db.execute(
-            "INSERT INTO sent_affirmations (user_id, affirmation_hash, sent_at) VALUES (?, ?, ?)",
-            (user_id, hash_, datetime.utcnow().isoformat())
-        )
-        await db.commit()
-        return text
+        if hash_ not in used_hashes:
+            await execute_query(
+                "INSERT INTO sent_affirmations (user_id, affirmation_hash, sent_at) VALUES ($1, $2, $3)",
+                user_id, hash_, datetime.utcnow()
+            )
+            return text
+    
+    text, hash_ = generate_affirmation()
+    await execute_query(
+        "INSERT INTO sent_affirmations (user_id, affirmation_hash, sent_at) VALUES ($1, $2, $3)",
+        user_id, hash_, datetime.utcnow()
+    )
+    return text
 
 # === HANDLERS ===
 router = Router()
@@ -151,12 +187,11 @@ def get_addressing(soft_name):
 
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
-    async with aconnect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
-            (message.from_user.id, message.from_user.username)
-        )
-        await db.commit()
+    await execute_query(
+        "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+        message.from_user.id,
+        message.from_user.username
+    )
     await message.answer(
         "Привет. Это твой дневник — место, где можно быть собой.\n\n"
         "Каждое утро я буду присылать тебе тихую аффирмацию. "
@@ -170,9 +205,7 @@ async def cmd_start(message: Message):
 
 @router.message(F.text.lower().in_({"да", "yes", "согласен"}))
 async def handle_agreement(message: Message):
-    async with aconnect(DB_PATH) as db:
-        await db.execute("UPDATE users SET agreed = 1 WHERE user_id = ?", (message.from_user.id,))
-        await db.commit()
+    await execute_query("UPDATE users SET agreed = TRUE WHERE user_id = $1", message.from_user.id)
     await message.answer(
         "Спасибо. 💛\n\n"
         "А теперь — как мне к тебе обращаться?\n"
@@ -222,13 +255,11 @@ async def delete_all_start(message: Message):
 
 @router.message(F.text == "Да, удалить всё")
 async def delete_all_confirm(message: Message):
-    async with aconnect(DB_PATH) as db:
-        await db.execute("DELETE FROM entries WHERE user_id = ?", (message.from_user.id,))
-        await db.execute(
-            "UPDATE users SET soft_name = NULL, last_entry = NULL WHERE user_id = ?",
-            (message.from_user.id,)
-        )
-        await db.commit()
+    await execute_query("DELETE FROM entries WHERE user_id = $1", message.from_user.id)
+    await execute_query(
+        "UPDATE users SET soft_name = NULL, last_entry = NULL WHERE user_id = $1",
+        message.from_user.id
+    )
     await message.answer(
         "Все твои записи удалены. 💫\n\n"
         "Если захочешь начать заново — просто напиши сюда.\n"
@@ -263,28 +294,25 @@ async def payment_success(message: Message):
     user_id = message.from_user.id
     days = 365 if payment.total_amount == 89000 else 30
     until = datetime.utcnow() + timedelta(days=days)
-    async with aconnect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET subscribed = 1, subscription_until = ? WHERE user_id = ?",
-            (until.isoformat(), user_id)
-        )
-        await db.commit()
+    await execute_query(
+        "UPDATE users SET subscribed = TRUE, subscription_until = $1 WHERE user_id = $2",
+        until, user_id
+    )
     await message.answer("Спасибо за доверие. 💛\n\nДневник — твой.")
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def save_entry(message: Message):
     if message.text in ["/terms", "/privacy", "/subscribe", "/delete_all"]:
         return
-    async with aconnect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO entries (user_id, text) VALUES (?, ?)",
-            (message.from_user.id, message.text)
-        )
-        await db.execute(
-            "UPDATE users SET last_entry = ? WHERE user_id = ?",
-            (datetime.utcnow().isoformat(), message.from_user.id)
-        )
-        await db.commit()
+    await execute_query(
+        "INSERT INTO entries (user_id, text) VALUES ($1, $2)",
+        message.from_user.id,
+        message.text
+    )
+    await execute_query(
+        "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
+        message.from_user.id
+    )
     await message.answer("Записано. ✨")
 
 @router.message(F.text)
@@ -293,9 +321,7 @@ async def handle_soft_name(message: Message):
         return
     user_text = message.text.strip()
     soft_name = None if user_text.lower() in ["без имени", "не хочу", "нет", "никак"] else user_text
-    async with aconnect(DB_PATH) as db:
-        await db.execute("UPDATE users SET soft_name = ? WHERE user_id = ?", (soft_name, message.from_user.id))
-        await db.commit()
+    await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
     prefix = get_addressing(soft_name)
     await message.answer(
         f"{prefix}дневник открыт. 🌿\n\n"
@@ -305,13 +331,11 @@ async def handle_soft_name(message: Message):
 
 # === SCHEDULER ===
 async def send_daily_affirmation(bot: Bot):
-    async with aconnect(DB_PATH) as db:
-        cursor = await db.execute("SELECT user_id FROM users WHERE agreed = 1")
-        users = await cursor.fetchall()
-    for (user_id,) in users:
+    users = await execute_query("SELECT user_id FROM users WHERE agreed = TRUE")
+    for user in users:
         try:
-            text = await get_unique_affirmation(user_id)
-            await bot.send_message(user_id, text)
+            text = await get_unique_affirmation(user["user_id"])
+            await bot.send_message(user["user_id"], text)
         except Exception:
             pass
 
