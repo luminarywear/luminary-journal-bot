@@ -6,8 +6,7 @@ import threading
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
-    LabeledPrice, PreCheckoutQuery
+    Message, ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,7 +17,7 @@ from dotenv import load_dotenv
 from aiohttp import web
 
 async def health_check(request):
-    return web.Response(text="OK", content_type="text/plain")
+    return web.Response(text="OK")
 
 def start_health_server():
     async def run_server():
@@ -29,13 +28,12 @@ def start_health_server():
         port = int(os.getenv("PORT", 10000))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        await asyncio.Event().wait()  # keep alive
+        await asyncio.Event().wait()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(run_server())
 
-# Запускаем health server в отдельном потоке
 threading.Thread(target=start_health_server, daemon=True).start()
 
 # === ОСНОВНОЙ КОД ===
@@ -62,6 +60,7 @@ async def init_db():
                 agreed BOOLEAN DEFAULT FALSE,
                 subscribed BOOLEAN DEFAULT FALSE,
                 subscription_until TIMESTAMP,
+                trial_until TIMESTAMP,
                 last_entry TIMESTAMP,
                 created_at TIMESTAMP DEFAULT NOW()
             )
@@ -94,6 +93,21 @@ async def execute_query(query, *params):
             await conn.execute(query, *params)
     finally:
         await conn.close()
+
+# === ПРОВЕРКА ДОСТУПА ===
+async def check_access(user_id: int) -> bool:
+    user = await execute_query(
+        "SELECT trial_until, subscribed, subscription_until FROM users WHERE user_id = $1",
+        user_id
+    )
+    if not user:
+        return False
+    
+    now = datetime.utcnow()
+    trial_active = user[0]["trial_until"] and user[0]["trial_until"] > now
+    sub_active = user[0]["subscribed"] and user[0]["subscription_until"] > now
+    
+    return trial_active or sub_active
 
 # === AFFIRMATIONS ===
 OPENINGS = [
@@ -187,16 +201,22 @@ def get_addressing(soft_name):
 
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await execute_query(
-        "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-        message.from_user.id,
-        message.from_user.username
-    )
+    now = datetime.utcnow()
+    trial_end = now + timedelta(days=32)
+    
+    await execute_query("""
+        INSERT INTO users (user_id, username, trial_until, agreed)
+        VALUES ($1, $2, $3, FALSE)
+        ON CONFLICT (user_id) DO UPDATE 
+        SET username = $2
+    """, message.from_user.id, message.from_user.username, trial_end)
+    
     await message.answer(
         "Привет. Это твой дневник — место, где можно быть собой.\n\n"
-        "Каждое утро я буду присылать тебе тихую аффирмацию. "
-        "А в любое время ты можешь написать сюда всё, что живёт внутри.\n\n"
-        "Перед началом — пожалуйста, ознакомься с нашим "
+        "У тебя есть <b>32 дня</b>, чтобы попробовать всё бесплатно.\n\n"
+        "Если дневник станет тебе дорог — после пробного периода "
+        "подписка стоит <b>120 ₽/мес</b>.\n\n"
+        "Перед началом — ознакомься с нашим "
         "<a href='https://luminarywear.ru/journal/terms.html'>пользовательским соглашением</a>.\n\n"
         "Если ты согласен(а) — напиши «Да».",
         parse_mode="HTML",
@@ -205,6 +225,10 @@ async def cmd_start(message: Message):
 
 @router.message(F.text.lower().in_({"да", "yes", "согласен"}))
 async def handle_agreement(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
+        return
+        
     await execute_query("UPDATE users SET agreed = TRUE WHERE user_id = $1", message.from_user.id)
     await message.answer(
         "Спасибо. 💛\n\n"
@@ -223,7 +247,7 @@ async def show_terms(message: Message):
         "• Это твоё пространство — записи принадлежат только тебе.\n"
         "• Мы не удаляем данные автоматически.\n"
         "• Приватность: никаких email, телефона, геолокации.\n"
-        "• Подписка: 7 дней бесплатно, потом — по желанию.\n\n"
+        "• Подписка: 32 дня бесплатно, потом — 120 ₽/мес.\n\n"
         "Полная версия: https://luminarywear.ru/journal/terms.html",
         parse_mode="HTML"
     )
@@ -241,6 +265,10 @@ async def show_privacy(message: Message):
 
 @router.message(F.text == "/delete_all")
 async def delete_all_start(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
+        return
+        
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Да, удалить всё")]],
         resize_keyboard=True,
@@ -255,6 +283,10 @@ async def delete_all_start(message: Message):
 
 @router.message(F.text == "Да, удалить всё")
 async def delete_all_confirm(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
+        return
+        
     await execute_query("DELETE FROM entries WHERE user_id = $1", message.from_user.id)
     await execute_query(
         "UPDATE users SET soft_name = NULL, last_entry = NULL WHERE user_id = $1",
@@ -267,71 +299,51 @@ async def delete_all_confirm(message: Message):
         reply_markup=None
     )
 
-@router.message(F.text == "/subscribe")
-async def subscribe(message: Message):
-    prices = [
-        LabeledPrice(label="1 месяц", amount=9900),
-        LabeledPrice(label="1 год", amount=89000),
-    ]
-    await message.bot.send_invoice(
-        chat_id=message.chat.id,
-        title="Luminary Journal — подписка",
-        description="Доступ к дневнику на месяц или год. Все записи сохраняются навсегда.",
-        payload="journal_sub",
-        provider_token="",
-        currency="XTR",
-        prices=prices,
-        start_parameter="journal_sub",
-    )
-
-@router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-@router.message(F.successful_payment)
-async def payment_success(message: Message):
-    payment = message.successful_payment
-    user_id = message.from_user.id
-    days = 365 if payment.total_amount == 89000 else 30
-    until = datetime.utcnow() + timedelta(days=days)
-    await execute_query(
-        "UPDATE users SET subscribed = TRUE, subscription_until = $1 WHERE user_id = $2",
-        until, user_id
-    )
-    await message.answer("Спасибо за доверие. 💛\n\nДневник — твой.")
-
 @router.message(F.text & ~F.text.startswith("/"))
-async def save_entry(message: Message):
-    if message.text in ["/terms", "/privacy", "/subscribe", "/delete_all"]:
+async def handle_message(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer(
+            "Пробный период завершён.\n\n"
+            "Чтобы продолжить пользоваться дневником, оформи подписку:\n"
+            "• <b>120 ₽</b> — на месяц\n\n"
+            "👉 <a href='https://tinkoff.ru/qr/ВАША_ССЫЛКА'>Оплатить</a>\n\n"
+            "После оплаты напиши сюда своё имя — и я восстановлю доступ.",
+            parse_mode="HTML"
+        )
         return
-    await execute_query(
-        "INSERT INTO entries (user_id, text) VALUES ($1, $2)",
-        message.from_user.id,
-        message.text
-    )
-    await execute_query(
-        "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
-        message.from_user.id
-    )
-    await message.answer("Записано. ✨")
 
-@router.message(F.text)
-async def handle_soft_name(message: Message):
-    if message.text in ["/terms", "/privacy", "/subscribe", "/delete_all", "Да, удалить всё"]:
+    text = message.text.strip()
+    if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
+        soft_name = None
+        await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
+        prefix = get_addressing(soft_name)
+        await message.answer(
+            f"{prefix}дневник открыт. 🌿\n\n"
+            "Пиши сюда всё, что живёт внутри — в любое время.\n"
+            "А завтра утром тебя ждёт первая аффирмация."
+        )
+    elif text in ["/terms", "/privacy", "/delete_all"]:
         return
-    user_text = message.text.strip()
-    soft_name = None if user_text.lower() in ["без имени", "не хочу", "нет", "никак"] else user_text
-    await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
-    prefix = get_addressing(soft_name)
-    await message.answer(
-        f"{prefix}дневник открыт. 🌿\n\n"
-        "Пиши сюда всё, что живёт внутри — в любое время.\n"
-        "А завтра утром тебя ждёт первая аффирмация."
-    )
+    else:
+        # Сохраняем запись
+        await execute_query(
+            "INSERT INTO entries (user_id, text) VALUES ($1, $2)",
+            message.from_user.id, text
+        )
+        await execute_query(
+            "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
+            message.from_user.id
+        )
+        await message.answer("Записано. ✨")
 
 # === SCHEDULER ===
 async def send_daily_affirmation(bot: Bot):
-    users = await execute_query("SELECT user_id FROM users WHERE agreed = TRUE")
+    now = datetime.utcnow()
+    users = await execute_query("""
+        SELECT user_id FROM users 
+        WHERE (trial_until > $1 OR (subscribed AND subscription_until > $1))
+        AND agreed = TRUE
+    """, now)
     for user in users:
         try:
             text = await get_unique_affirmation(user["user_id"])
