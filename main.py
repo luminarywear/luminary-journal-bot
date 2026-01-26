@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton
+    Message, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -510,7 +510,7 @@ class JournalStates(StatesGroup):
     waiting_for_achievement = State()
     waiting_for_gratitude = State()
     waiting_for_entry = State()
-    waiting_for_name = State()  # ← новое состояние
+    waiting_for_name = State()
 
 # === ROUTER ===
 router = Router()
@@ -524,6 +524,7 @@ def get_main_menu():
             [KeyboardButton(text="🌱 Добавить достижение")],
             [KeyboardButton(text="🤍 Добавить благодарность себе")],
             [KeyboardButton(text="✍️ Добавить запись")],
+            [KeyboardButton(text="✅ Я оплатил(а) — восстановить доступ")],
             [KeyboardButton(text="🌱 Мои достижения")],
             [KeyboardButton(text="🤍 Мои благодарности")],
             [KeyboardButton(text="📜 Мои записи")]
@@ -532,8 +533,40 @@ def get_main_menu():
         one_time_keyboard=False
     )
 
-# === HANDLERS ===
+# === КОМАНДЫ ДЛЯ TELEGRAM STARS ===
+@router.message(F.text == "/terms")
+async def show_terms(message: Message):
+    await message.answer(
+        "<b>Пользовательское соглашение</b>\n\n"
+        "• Возраст: от 14 лет (без согласия родителей).\n"
+        "• Это твоё пространство — записи принадлежат только тебе.\n"
+        "• Мы не удаляем данные автоматически.\n"
+        "• Приватность: никаких email, телефона, геолокации.\n"
+        "• Подписка: 32 дня бесплатно, потом — 120 ₽/мес.\n\n"
+        "Полная версия: https://luminarywear.ru/journal/terms.html",
+        parse_mode="HTML"
+    )
 
+@router.message(F.text == "/support")
+async def show_support(message: Message):
+    await message.answer(
+        "Если у тебя есть вопросы или что-то не работает — напиши мне.\n\n"
+        "Я отвечаю в течение 24 часов. 💛\n\n"
+        "Ты можешь просто описать ситуацию — я помогу."
+    )
+
+@router.message(F.text == "/paysupport")
+async def show_paysupport(message: Message):
+    await message.answer(
+        "Вопросы по оплате? Напиши мне.\n\n"
+        "Укажи:\n"
+        "• Своё мягкое имя\n"
+        "• Дату и время оплаты\n"
+        "• Скриншот (можно закрыть реквизиты)\n\n"
+        "Я восстановлю доступ в течение 24 часов. 💛"
+    )
+
+# === START & AGREEMENT ===
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
     now = datetime.utcnow()
@@ -561,7 +594,7 @@ async def cmd_start(message: Message):
 @router.message(F.text.lower().in_({"да", "yes", "согласен"}))
 async def handle_agreement(message: Message, state: FSMContext):
     if not await check_access(message.from_user.id):
-        await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
+        await message.answer("Пробный период завершён...")
         return
         
     await execute_query("UPDATE users SET agreed = TRUE WHERE user_id = $1", message.from_user.id)
@@ -591,6 +624,69 @@ async def handle_name_input(message: Message, state: FSMContext):
         "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
         "Просто нажми на кнопку ниже.",
         reply_markup=get_main_menu()
+    )
+
+# === ОБРАБОТКА ОПЛАТЫ ЧЕРЕЗ STARS ===
+@router.message(F.text == "⭐ Поддержать")
+async def send_invoice(message: Message, bot: Bot):
+    if await check_access(message.from_user.id):
+        await message.answer("У тебя уже активен доступ. Спасибо, что здесь. 💚")
+        return
+
+    prices = [LabeledPrice(label="Подписка на месяц", amount=5000)]  # 50 Stars = 5000
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title="Luminary Journal — подписка",
+        description="Доступ к дневнику на 30 дней",
+        payload=f"sub_{message.from_user.id}",
+        provider_token="",  # Для Stars — пустая строка
+        currency="XTR",     # XTR = Telegram Stars
+        prices=prices,
+        max_tip_amount=0,
+        suggested_tip_amounts=[]
+    )
+
+# === УСПЕШНАЯ ОПЛАТА ===
+@router.message(F.successful_payment)
+async def handle_successful_payment(message: Message):
+    user_id = message.from_user.id
+    await execute_query("""
+        UPDATE users 
+        SET subscribed = TRUE, subscription_until = NOW() + INTERVAL '30 days'
+        WHERE user_id = $1
+    """, user_id)
+    await message.answer(
+        "Спасибо за поддержку! 💛\n\n"
+        "Доступ к дневнику продлён на 30 дней.\n"
+        "Продолжай писать — я рядом."
+    )
+
+# === РУЧНОЙ ЗАПРОС НА ВОССТАНОВЛЕНИЕ ===
+YOUR_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+@router.message(F.text == "✅ Я оплатил(а) — восстановить доступ")
+async def handle_payment_request(message: Message, bot: Bot):
+    if await check_access(message.from_user.id):
+        await message.answer("У тебя уже активен доступ к дневнику. 💚")
+        return
+
+    user = await execute_query("SELECT soft_name FROM users WHERE user_id = $1", message.from_user.id)
+    soft_name = user[0]["soft_name"] if user and user[0]["soft_name"] else "без имени"
+
+    if YOUR_ADMIN_ID:
+        await bot.send_message(
+            YOUR_ADMIN_ID,
+            f"🔔 Запрос на восстановление доступа\n\n"
+            f"User ID: <code>{message.from_user.id}</code>\n"
+            f"Имя: {soft_name}\n"
+            f"Telegram: @{message.from_user.username or 'нет'}",
+            parse_mode="HTML"
+        )
+
+    await message.answer(
+        "Спасибо! 💛\n\n"
+        "Я передал(а) запрос администратору.\n"
+        "Доступ будет восстановлен в течение 24 часов."
     )
 
 # === ДОБАВЛЕНИЕ ЗАПИСЕЙ ===
