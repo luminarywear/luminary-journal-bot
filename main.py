@@ -510,6 +510,7 @@ class JournalStates(StatesGroup):
     waiting_for_achievement = State()
     waiting_for_gratitude = State()
     waiting_for_entry = State()
+    waiting_for_name = State()  # ← новое состояние
 
 # === ROUTER ===
 router = Router()
@@ -558,12 +559,13 @@ async def cmd_start(message: Message):
     )
 
 @router.message(F.text.lower().in_({"да", "yes", "согласен"}))
-async def handle_agreement(message: Message):
+async def handle_agreement(message: Message, state: FSMContext):
     if not await check_access(message.from_user.id):
         await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
         return
         
     await execute_query("UPDATE users SET agreed = TRUE WHERE user_id = $1", message.from_user.id)
+    await state.set_state(JournalStates.waiting_for_name)
     await message.answer(
         "Спасибо. 💛\n\n"
         "А теперь — как мне к тебе обращаться?\n"
@@ -573,25 +575,8 @@ async def handle_agreement(message: Message):
         parse_mode="HTML"
     )
 
-# === ТОЛЬКО ДЛЯ ВВОДА ИМЕНИ (один раз после /start) ===
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_soft_name(message: Message, state: FSMContext):
-    # Проверяем: пользователь уже ввёл имя?
-    user = await execute_query(
-        "SELECT soft_name FROM users WHERE user_id = $1 AND soft_name IS NOT NULL",
-        message.from_user.id
-    )
-    
-    if user:
-        # Имя уже введено — не обрабатываем
-        return
-
-    # Проверяем: пользователь имеет доступ (согласился и в пробном периоде)?
-    access = await check_access(message.from_user.id)
-    if not access:
-        return
-
-    # Это ввод имени
+@router.message(JournalStates.waiting_for_name)
+async def handle_name_input(message: Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
         soft_name = None
@@ -600,6 +585,7 @@ async def handle_soft_name(message: Message, state: FSMContext):
         
     await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
     prefix = get_addressing(soft_name)
+    await state.clear()
     await message.answer(
         f"{prefix}дневник открыт. 🌿\n\n"
         "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
