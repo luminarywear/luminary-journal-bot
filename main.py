@@ -486,7 +486,7 @@ async def get_unique_affirmation(user_id: int):
         "SELECT affirmation_hash FROM sent_affirmations WHERE user_id = $1 AND sent_at > $2",
         user_id, since
     )
-    used_hashes = {row["affirmmation_hash"] for row in rows}
+    used_hashes = {row["affirmation_hash"] for row in rows}
     
     for text in AFFIRMATIONS:
         hash_ = hashlib.sha256(text.encode()).hexdigest()[:16]
@@ -573,32 +573,27 @@ async def handle_agreement(message: Message):
         parse_mode="HTML"
     )
 
-# === ЕДИНСТВЕННЫЙ ОБРАБОТЧИК ТЕКСТА ===
+# === ТОЛЬКО ДЛЯ ВВОДА ИМЕНИ ===
 @router.message(F.text & ~F.text.startswith("/"))
-async def handle_soft_name_or_fallback(message: Message, state: FSMContext):
+async def handle_soft_name(message: Message, state: FSMContext):
     user = await execute_query("SELECT soft_name FROM users WHERE user_id = $1", message.from_user.id)
-    
-    if not user or user[0]["soft_name"] is None:
-        text = message.text.strip()
-        if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
-            soft_name = None
-        else:
-            soft_name = text
-        await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
-        prefix = get_addressing(soft_name)
-        await message.answer(
-            f"{prefix}дневник открыт. 🌿\n\n"
-            "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
-            "Просто нажми на кнопку ниже.",
-            reply_markup=get_main_menu()
-        )
+    if user and user[0]["soft_name"] is not None:
+        # Имя уже введено — игнорируем
         return
-    
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-    
-    await message.answer("Используй кнопки ниже.", reply_markup=get_main_menu())
+
+    text = message.text.strip()
+    if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
+        soft_name = None
+    else:
+        soft_name = text
+    await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
+    prefix = get_addressing(soft_name)
+    await message.answer(
+        f"{prefix}дневник открыт. 🌿\n\n"
+        "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
+        "Просто нажми на кнопку ниже.",
+        reply_markup=get_main_menu()
+    )
 
 # === ДОБАВЛЕНИЕ ЗАПИСЕЙ ===
 
