@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
+    Message, ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -486,7 +486,7 @@ async def get_unique_affirmation(user_id: int):
         "SELECT affirmation_hash FROM sent_affirmations WHERE user_id = $1 AND sent_at > $2",
         user_id, since
     )
-    used_hashes = {row["affirmation_hash"] for row in rows}
+    used_hashes = {row["affirmmation_hash"] for row in rows}
     
     for text in AFFIRMATIONS:
         hash_ = hashlib.sha256(text.encode()).hexdigest()[:16]
@@ -573,11 +573,12 @@ async def handle_agreement(message: Message):
         parse_mode="HTML"
     )
 
-# === ВВОД МЯГКОГО ИМЕНИ ===
+# === ЕДИНСТВЕННЫЙ ОБРАБОТЧИК ТЕКСТА ===
 @router.message(F.text & ~F.text.startswith("/"))
-async def handle_soft_name(message: Message):
-    user = await execute_query("SELECT agreed FROM users WHERE user_id = $1", message.from_user.id)
-    if not user or not user[0]["agreed"]:
+async def handle_soft_name_or_fallback(message: Message, state: FSMContext):
+    user = await execute_query("SELECT soft_name FROM users WHERE user_id = $1", message.from_user.id)
+    
+    if not user or user[0]["soft_name"] is None:
         text = message.text.strip()
         if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
             soft_name = None
@@ -592,6 +593,12 @@ async def handle_soft_name(message: Message):
             reply_markup=get_main_menu()
         )
         return
+    
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+    
+    await message.answer("Используй кнопки ниже.", reply_markup=get_main_menu())
 
 # === ДОБАВЛЕНИЕ ЗАПИСЕЙ ===
 
@@ -683,7 +690,7 @@ async def show_achievements(message: Message):
         ORDER BY created_at DESC
     """, message.from_user.id)
     if not rows:
-        await message.answer("У тебя пока нет достижений. 🌿")
+        await message.answer("Это пространство ждёт твои слова.\nКогда захочешь — просто напиши. 🤍")
         return
     entries = "\n\n".join(f"• {row['text']}" for row in reversed(rows))
     await message.answer(f"Твои достижения:\n\n{entries}")
@@ -699,7 +706,7 @@ async def show_gratitudes(message: Message):
         ORDER BY created_at DESC
     """, message.from_user.id)
     if not rows:
-        await message.answer("У тебя пока нет благодарностей. 🤍")
+        await message.answer("Это пространство ждёт твои слова.\nКогда захочешь — просто напиши. 🤍")
         return
     entries = "\n\n".join(f"• {row['text']}" for row in reversed(rows))
     await message.answer(f"Твои благодарности:\n\n{entries}")
@@ -715,7 +722,7 @@ async def show_entries(message: Message):
         ORDER BY created_at DESC
     """, message.from_user.id)
     if not rows:
-        await message.answer("У тебя пока нет записей. 🌿")
+        await message.answer("Это пространство ждёт твои слова.\nКогда захочешь — просто напиши. 🤍")
         return
     entries = "\n\n".join(f"• {row['text']}" for row in reversed(rows))
     await message.answer(f"Твои записи:\n\n{entries}")
