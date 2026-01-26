@@ -573,19 +573,31 @@ async def handle_agreement(message: Message):
         parse_mode="HTML"
     )
 
-# === ТОЛЬКО ДЛЯ ВВОДА ИМЕНИ ===
+# === ТОЛЬКО ДЛЯ ВВОДА ИМЕНИ (один раз после /start) ===
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_soft_name(message: Message, state: FSMContext):
-    user = await execute_query("SELECT soft_name FROM users WHERE user_id = $1", message.from_user.id)
-    if user and user[0]["soft_name"] is not None:
-        # Имя уже введено — игнорируем
+    # Проверяем: пользователь уже ввёл имя?
+    user = await execute_query(
+        "SELECT soft_name FROM users WHERE user_id = $1 AND soft_name IS NOT NULL",
+        message.from_user.id
+    )
+    
+    if user:
+        # Имя уже введено — не обрабатываем
         return
 
+    # Проверяем: пользователь имеет доступ (согласился и в пробном периоде)?
+    access = await check_access(message.from_user.id)
+    if not access:
+        return
+
+    # Это ввод имени
     text = message.text.strip()
     if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
         soft_name = None
     else:
         soft_name = text
+        
     await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
     prefix = get_addressing(soft_name)
     await message.answer(
