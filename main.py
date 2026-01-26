@@ -6,14 +6,16 @@ import threading
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton
+    Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 )
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
-# === HEALTH CHECK (внешний будильник) ===
+# === HEALTH CHECK ===
 from aiohttp import web
 
 async def health_check(request):
@@ -503,11 +505,33 @@ async def get_unique_affirmation(user_id: int):
     )
     return text
 
-# === HANDLERS ===
+# === FSM STATES ===
+class JournalStates(StatesGroup):
+    waiting_for_achievement = State()
+    waiting_for_gratitude = State()
+    waiting_for_entry = State()
+
+# === ROUTER ===
 router = Router()
 
 def get_addressing(soft_name):
     return f"{soft_name}, " if soft_name else ""
+
+def get_main_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🌱 Добавить достижение")],
+            [KeyboardButton(text="🤍 Добавить благодарность себе")],
+            [KeyboardButton(text="✍️ Добавить запись")],
+            [KeyboardButton(text="🌱 Мои достижения")],
+            [KeyboardButton(text="🤍 Мои благодарности")],
+            [KeyboardButton(text="📜 Мои записи")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+# === HANDLERS ===
 
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
@@ -549,34 +573,159 @@ async def handle_agreement(message: Message):
         parse_mode="HTML"
     )
 
-@router.message(F.text == "/terms")
-async def show_terms(message: Message):
-    await message.answer(
-        "<b>Пользовательское соглашение</b>\n\n"
-        "• Возраст: от 14 лет (без согласия родителей).\n"
-        "• Это твоё пространство — записи принадлежат только тебе.\n"
-        "• Мы не удаляем данные автоматически.\n"
-        "• Приватность: никаких email, телефона, геолокации.\n"
-        "• Подписка: 32 дня бесплатно, потом — 120 ₽/мес.\n\n"
-        "Полная версия: https://luminarywear.ru/journal/terms.html",
-        parse_mode="HTML"
-    )
+# === ВВОД МЯГКОГО ИМЕНИ ===
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_soft_name(message: Message):
+    user = await execute_query("SELECT agreed FROM users WHERE user_id = $1", message.from_user.id)
+    if not user or not user[0]["agreed"]:
+        text = message.text.strip()
+        if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
+            soft_name = None
+        else:
+            soft_name = text
+        await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
+        prefix = get_addressing(soft_name)
+        await message.answer(
+            f"{prefix}дневник открыт. 🌿\n\n"
+            "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
+            "Просто нажми на кнопку ниже.",
+            reply_markup=get_main_menu()
+        )
+        return
 
-@router.message(F.text == "/privacy")
-async def show_privacy(message: Message):
-    await message.answer(
-        "<b>Политика конфиденциальности</b>\n\n"
-        "• Собираем: Telegram ID, записи, мягкое имя (если дал).\n"
-        "• Не делимся, не продаём, не анализируем.\n"
-        "• Хочешь удалить всё? Напиши /delete_all.\n\n"
-        "Полная версия: https://luminarywear.ru/journal/privacy.html",
-        parse_mode="HTML"
+# === ДОБАВЛЕНИЕ ЗАПИСЕЙ ===
+
+@router.message(F.text == "🌱 Добавить достижение")
+async def add_achievement_start(message: Message, state: FSMContext):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    await state.set_state(JournalStates.waiting_for_achievement)
+    await message.answer("Напиши своё достижение — большое или маленькое. 🌱")
+
+@router.message(JournalStates.waiting_for_achievement)
+async def add_achievement_save(message: Message, state: FSMContext):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    text = message.text.strip()
+    await execute_query(
+        "INSERT INTO entries (user_id, text, entry_type) VALUES ($1, $2, 'achievement')",
+        message.from_user.id, text
     )
+    await execute_query(
+        "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
+        message.from_user.id
+    )
+    await state.clear()
+    await message.answer("Достижение добавлено. 🌱", reply_markup=get_main_menu())
+
+@router.message(F.text == "🤍 Добавить благодарность себе")
+async def add_gratitude_start(message: Message, state: FSMContext):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    await state.set_state(JournalStates.waiting_for_gratitude)
+    await message.answer("Напиши, за что ты благодарен(а) себе сегодня. 🤍")
+
+@router.message(JournalStates.waiting_for_gratitude)
+async def add_gratitude_save(message: Message, state: FSMContext):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    text = message.text.strip()
+    await execute_query(
+        "INSERT INTO entries (user_id, text, entry_type) VALUES ($1, $2, 'gratitude')",
+        message.from_user.id, text
+    )
+    await execute_query(
+        "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
+        message.from_user.id
+    )
+    await state.clear()
+    await message.answer("Благодарность добавлена. 🤍", reply_markup=get_main_menu())
+
+@router.message(F.text == "✍️ Добавить запись")
+async def add_entry_start(message: Message, state: FSMContext):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    await state.set_state(JournalStates.waiting_for_entry)
+    await message.answer("Напиши свою запись. 💚")
+
+@router.message(JournalStates.waiting_for_entry)
+async def add_entry_save(message: Message, state: FSMContext):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    text = message.text.strip()
+    await execute_query(
+        "INSERT INTO entries (user_id, text, entry_type) VALUES ($1, $2, 'free')",
+        message.from_user.id, text
+    )
+    await execute_query(
+        "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
+        message.from_user.id
+    )
+    await state.clear()
+    await message.answer("Записано. ✨", reply_markup=get_main_menu())
+
+# === ПРОСМОТР ЗАПИСЕЙ ===
+
+@router.message(F.text == "🌱 Мои достижения")
+async def show_achievements(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    rows = await execute_query("""
+        SELECT text FROM entries 
+        WHERE user_id = $1 AND entry_type = 'achievement'
+        ORDER BY created_at DESC
+    """, message.from_user.id)
+    if not rows:
+        await message.answer("У тебя пока нет достижений. 🌿")
+        return
+    entries = "\n\n".join(f"• {row['text']}" for row in reversed(rows))
+    await message.answer(f"Твои достижения:\n\n{entries}")
+
+@router.message(F.text == "🤍 Мои благодарности")
+async def show_gratitudes(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    rows = await execute_query("""
+        SELECT text FROM entries 
+        WHERE user_id = $1 AND entry_type = 'gratitude'
+        ORDER BY created_at DESC
+    """, message.from_user.id)
+    if not rows:
+        await message.answer("У тебя пока нет благодарностей. 🤍")
+        return
+    entries = "\n\n".join(f"• {row['text']}" for row in reversed(rows))
+    await message.answer(f"Твои благодарности:\n\n{entries}")
+
+@router.message(F.text == "📜 Мои записи")
+async def show_entries(message: Message):
+    if not await check_access(message.from_user.id):
+        await message.answer("Пробный период завершён...")
+        return
+    rows = await execute_query("""
+        SELECT text FROM entries 
+        WHERE user_id = $1 AND entry_type = 'free'
+        ORDER BY created_at DESC
+    """, message.from_user.id)
+    if not rows:
+        await message.answer("У тебя пока нет записей. 🌿")
+        return
+    entries = "\n\n".join(f"• {row['text']}" for row in reversed(rows))
+    await message.answer(f"Твои записи:\n\n{entries}")
+
+# === УДАЛЕНИЕ ===
 
 @router.message(F.text == "/delete_all")
 async def delete_all_start(message: Message):
     if not await check_access(message.from_user.id):
-        await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
+        await message.answer("Пробный период завершён...")
         return
         
     kb = ReplyKeyboardMarkup(
@@ -594,7 +743,7 @@ async def delete_all_start(message: Message):
 @router.message(F.text == "Да, удалить всё")
 async def delete_all_confirm(message: Message):
     if not await check_access(message.from_user.id):
-        await message.answer("Пробный период завершён. Чтобы продолжить, оформи подписку.")
+        await message.answer("Пробный период завершён...")
         return
         
     await execute_query("DELETE FROM entries WHERE user_id = $1", message.from_user.id)
@@ -606,46 +755,11 @@ async def delete_all_confirm(message: Message):
         "Все твои записи удалены. 🤍\n\n"
         "Если захочешь начать заново — просто напиши сюда.\n"
         "Дневник всегда открыт.",
-        reply_markup=None
+        reply_markup=get_main_menu()
     )
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_message(message: Message):
-    if not await check_access(message.from_user.id):
-        await message.answer(
-            "Пробный период завершён.\n\n"
-            "Чтобы продолжить пользоваться дневником, оформи подписку:\n"
-            "• <b>120 ₽</b> — на месяц\n\n"
-            "👉 <a href='https://www.tbank.ru/cf/59baQBY0btD'>Оплатить</a>\n\n"
-            "После оплаты напиши сюда своё имя — и я восстановлю доступ.",
-            parse_mode="HTML"
-        )
-        return
-
-    text = message.text.strip()
-    if text.lower() in ["без имени", "не хочу", "нет", "никак"]:
-        soft_name = None
-        await execute_query("UPDATE users SET soft_name = $1 WHERE user_id = $2", soft_name, message.from_user.id)
-        prefix = get_addressing(soft_name)
-        await message.answer(
-            f"{prefix}дневник открыт. 🌿\n\n"
-            "Пиши сюда всё, что живёт внутри — в любое время.\n"
-            "А завтра утром тебя ждёт первая аффирмация."
-        )
-    elif text in ["/terms", "/privacy", "/delete_all"]:
-        return
-    else:
-        await execute_query(
-            "INSERT INTO entries (user_id, text) VALUES ($1, $2)",
-            message.from_user.id, text
-        )
-        await execute_query(
-            "UPDATE users SET last_entry = NOW() WHERE user_id = $1",
-            message.from_user.id
-        )
-        await message.answer("Записано. ✨")
-
 # === SCHEDULER ===
+
 async def send_daily_affirmation(bot: Bot):
     now = datetime.utcnow()
     users = await execute_query("""
@@ -660,11 +774,58 @@ async def send_daily_affirmation(bot: Bot):
         except Exception:
             pass
 
+async def send_monthly_summary(bot: Bot):
+    now = datetime.utcnow()
+    first_day_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day_last_month = first_day_this_month - timedelta(seconds=1)
+    first_day_last_month = last_day_last_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    users = await execute_query("""
+        SELECT user_id FROM users 
+        WHERE (trial_until > $1 OR (subscribed AND subscription_until > $1))
+        AND agreed = TRUE
+    """, now)
+
+    for user in users:
+        try:
+            rows = await execute_query("""
+                SELECT text, entry_type 
+                FROM entries 
+                WHERE user_id = $1 
+                  AND created_at BETWEEN $2 AND $3
+                  AND entry_type IN ('achievement', 'gratitude')
+                ORDER BY created_at
+            """, user["user_id"], first_day_last_month, last_day_last_month)
+
+            if not rows:
+                continue
+
+            achievements = [r["text"] for r in rows if r["entry_type"] == "achievement"]
+            gratitudes = [r["text"] for r in rows if r["entry_type"] == "gratitude"]
+
+            intro = "Рост и забота о себе — есть всегда.\nВот твои отмеченные моменты. ✨\n\n"
+            text = intro
+
+            if achievements:
+                text += "🌱 **Достижения**\n" + "\n".join(f"• {a}" for a in achievements) + "\n\n"
+            if gratitudes:
+                text += "🤍 **Благодарности себе**\n" + "\n".join(f"• {g}" for g in gratitudes)
+
+            await bot.send_message(user["user_id"], text, parse_mode="HTML")
+
+        except Exception:
+            pass
+
 def setup_scheduler(bot: Bot):
-    scheduler = AsyncIOScheduler(timezone=os.getenv("TIMEZONE", "UTC"))
+    scheduler = AsyncIOScheduler(timezone=os.getenv("TIMEZONE", "Europe/Moscow"))
     scheduler.add_job(
         send_daily_affirmation,
         CronTrigger(hour=8, minute=0),
+        args=[bot]
+    )
+    scheduler.add_job(
+        send_monthly_summary,
+        CronTrigger(day=1, hour=9, minute=0),
         args=[bot]
     )
     scheduler.start()
