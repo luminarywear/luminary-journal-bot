@@ -828,7 +828,14 @@ def get_main_menu():
         resize_keyboard=True,
         one_time_keyboard=False
     )
-
+def silence_off_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔔 Выйти из режима тишины")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
 
 # === START ===
 @router.message(F.text == "/start")
@@ -1090,12 +1097,29 @@ async def send_summary(message: Message):
 @router.message(F.text == "🕊️ Режим тишины")
 async def enable_silence_button(message: Message):
     until = datetime.utcnow() + timedelta(days=7)
+
     await execute_query(
         "UPDATE users SET silence_until = $1 WHERE user_id = $2",
         until, message.from_user.id
     )
 
-    await message.answer("🌙 Режим тишины включён")
+    await message.answer(
+        "🌙 Режим тишины включён",
+        reply_markup=silence_off_menu()
+    )
+
+@router.message(F.text == "🔔 Выйти из режима тишины")
+async def disable_silence_button(message: Message):
+    await execute_query(
+        "UPDATE users SET silence_until = NULL WHERE user_id = $1",
+        message.from_user.id
+    )
+
+    await message.answer(
+        "✨ Режим тишины выключен",
+        reply_markup=get_main_menu()
+    )
+
 
 # === ОБЯЗАТЕЛЬНЫЕ КОМАНДЫ ДЛЯ TELEGRAM ===
 
@@ -1286,14 +1310,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-@router.message()
-async def disable_silence_on_any_message(message: Message):
-    await execute_query(
-        """
-        UPDATE users
-        SET silence_until = NULL
-        WHERE user_id = $1 AND silence_until IS NOT NULL
-        """,
-        message.from_user.id
-    )
