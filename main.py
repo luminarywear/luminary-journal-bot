@@ -829,6 +829,7 @@ def get_main_menu():
         one_time_keyboard=False
     )
 
+
 # === START ===
 @router.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
@@ -1289,3 +1290,14 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+@router.message()
+async def disable_silence_on_any_message(message: Message):
+    await execute_query(
+        """
+        UPDATE users
+        SET silence_until = NULL
+        WHERE user_id = $1 AND silence_until IS NOT NULL
+        """,
+        message.from_user.id
+    )
