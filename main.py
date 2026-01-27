@@ -1235,35 +1235,48 @@ async def send_monthly_gratitude(bot: Bot):
             pass
 
 # === SCHEDULER ===
+
+scheduler = None  # важно: глобальная ссылка
+
 def setup_scheduler(bot: Bot):
+    global scheduler
+
     moscow_tz = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
     scheduler = AsyncIOScheduler(timezone=moscow_tz)
+
     scheduler.add_job(
         send_daily_affirmation,
-        CronTrigger(hour=8, minute=0, timezone=moscow_tz),
+        CronTrigger(hour=8, minute=0),
         args=[bot]
     )
+
     scheduler.add_job(
         send_evening_question,
-        CronTrigger(hour=20, minute=0, timezone=moscow_tz),
+        CronTrigger(hour=20, minute=0),
         args=[bot]
     )
+
     scheduler.add_job(
         send_breathing_reminder,
-        CronTrigger(hour=10, minute=0, timezone=moscow_tz),
+        CronTrigger(hour=10, minute=0),
         args=[bot]
     )
+
     scheduler.add_job(
         send_anniversary,
-        CronTrigger(hour=12, minute=0, timezone=moscow_tz),
+        CronTrigger(hour=12, minute=0),
         args=[bot]
     )
+
     scheduler.add_job(
         send_monthly_gratitude,
-        CronTrigger(day=1, hour=9, minute=0, timezone=moscow_tz),
+        CronTrigger(day=1, hour=9, minute=0),
         args=[bot]
     )
+
     scheduler.start()
+    print("✅ APScheduler started")
+
 
 # === MAIN ===
 async def main():
