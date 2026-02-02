@@ -1149,7 +1149,7 @@ async def show_help(message: Message):
 
 # === ЕЖЕДНЕВНЫЕ АФФИРМАЦИИ ===
 async def _send_affirmations(bot: Bot, prefix: str, log_label: str):
-users = await execute_query("SELECT user_id FROM users")
+    users = await execute_query("SELECT user_id FROM users")
     for user in users:
         try:
             text = await get_unique_affirmation(user["user_id"])
