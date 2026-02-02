@@ -1310,3 +1310,63 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# === ЗАПУСК БОТА ===
+
+async def send_morning_affirmations(bot: Bot):
+    now = datetime.utcnow()
+    rows = await execute_query(
+        "SELECT user_id, silence_until FROM users"
+    )
+    for row in rows:
+        if row["silence_until"] and row["silence_until"] > now:
+            continue
+        text = await get_unique_affirmation(row["user_id"])
+        try:
+            await bot.send_message(row["user_id"], f"☀️ {text}")
+        except Exception as e:
+            print(f"Morning send error: {e}")
+
+async def send_evening_questions(bot: Bot):
+    now = datetime.utcnow()
+    rows = await execute_query(
+        "SELECT user_id, silence_until FROM users"
+    )
+    for row in rows:
+        if row["silence_until"] and row["silence_until"] > now:
+            continue
+        text = await get_unique_question(row["user_id"])
+        try:
+            await bot.send_message(row["user_id"], f"🌙 {text}")
+        except Exception as e:
+            print(f"Evening send error: {e}")
+
+async def main():
+    await init_db()
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    scheduler = AsyncIOScheduler(timezone=pytz.UTC)
+
+    scheduler.add_job(
+        send_morning_affirmations,
+        CronTrigger(hour=5, minute=0),  # 8:00 МСК
+        args=[bot]
+    )
+
+    scheduler.add_job(
+        send_evening_questions,
+        CronTrigger(hour=17, minute=0),  # 20:00 МСК
+        args=[bot]
+    )
+
+    scheduler.start()
+
+    print("🤍 Diary bot is running")
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
