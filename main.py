@@ -969,7 +969,7 @@ async def add_entry_save(message: Message, state: FSMContext):
         message.from_user.id, text
     )
     await state.clear()
-   await message.answer(
+    await message.answer(
         "Записано. ✨",
         reply_markup=await get_user_menu(message.from_user.id)
     )
