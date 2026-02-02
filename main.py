@@ -812,20 +812,13 @@ router = Router()
 def get_addressing(soft_name):
     return f"{soft_name}, " if soft_name else ""
 
-def get_main_menu(silence_enabled: bool = False):
+def get_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🌱 Добавить достижение")],
             [KeyboardButton(text="🤍 Добавить благодарность себе")],
             [KeyboardButton(text="✍️ Добавить запись")],
             [KeyboardButton(text="🌀 Режим «Здесь и Сейчас»")],
-            [
-                KeyboardButton(
-                    text="🔔 Выйти из режима тишины"
-                    if silence_enabled
-                    else "🕊️ Режим тишины"
-                )
-            ],
             [KeyboardButton(text="Поддержать дыхание дневника 🌱")],
             [KeyboardButton(text="🌱 Мои достижения")],
             [KeyboardButton(text="🤍 Мои благодарности")],
@@ -836,13 +829,7 @@ def get_main_menu(silence_enabled: bool = False):
     )
 
 async def get_user_menu(user_id: int) -> ReplyKeyboardMarkup:
-    rows = await execute_query(
-        "SELECT silence_until FROM users WHERE user_id = $1",
-        user_id
-    )
-    silence_until = rows[0]["silence_until"] if rows else None
-    silence_enabled = bool(silence_until and silence_until > datetime.utcnow())
-    return get_main_menu(silence_enabled=silence_enabled)
+    return get_main_menu()
 
 # === START ===
 @router.message(F.text == "/start")
@@ -897,7 +884,6 @@ async def handle_name_input(message: Message, state: FSMContext):
                 "🤍 <b>Добавить благодарность себе</b> — поблагодари себя за заботу\n"
                 "✍️ <b>Добавить запись</b> — напиши всё, что на сердце\n"
                 "🌀 <b>Режим «Здесь и Сейчас»</b> — опиши своё настоящее состояние\n"
-                "🕊️ <b>Режим тишины</b> — на 7 дней без утренних/вечерних сообщений\n"
                 "🌱 <b>Поддержать дыхание дневника</b> — если захочешь отблагодарить\n\n"
                 "Ты можешь просто быть здесь. Всё остальное — по желанию. 💚",
                 parse_mode="HTML"
@@ -1109,34 +1095,6 @@ async def send_summary(message: Message):
         "Спасибо, что доверяешь мне свои слова. 💚"
     )
 
-# === РЕЖИМ ТИШИНЫ (КНОПКА) ===
-@router.message(F.text == "🕊️ Режим тишины")
-async def enable_silence_button(message: Message):
-    until = datetime.utcnow() + timedelta(days=7)
-
-    await execute_query(
-        "UPDATE users SET silence_until = $1 WHERE user_id = $2",
-        until, message.from_user.id
-    )
-
-    await message.answer(
-        "🌙 Режим тишины включён",
-        reply_markup=await get_user_menu(message.from_user.id)
-    )
-
-@router.message(F.text == "🔔 Выйти из режима тишины")
-async def disable_silence_button(message: Message):
-    await execute_query(
-        "UPDATE users SET silence_until = NULL WHERE user_id = $1",
-        message.from_user.id
-    )
-
-    await message.answer(
-        "✨ Режим тишины выключен",
-        reply_markup=await get_user_menu(message.from_user.id)
-    )
-
-
 # === ОБЯЗАТЕЛЬНЫЕ КОМАНДЫ ДЛЯ TELEGRAM ===
 
 @router.message(F.text == "/terms")
@@ -1184,7 +1142,6 @@ async def show_help(message: Message):
         "🤍 <b>Добавить благодарность себе</b> — поблагодари себя за заботу\n"
         "✍️ <b>Добавить запись</b> — напиши всё, что на сердце\n"
         "🌀 <b>Режим «Здесь и Сейчас»</b> — опиши своё настоящее состояние\n"
-        "🕊️ <b>Режим тишины</b> — на 7 дней без утренних/вечерних сообщений\n"
         "🌱 <b>Поддержать дыхание дневника</b> — если захочешь отблагодарить\n\n"
         "Ты можешь просто быть здесь. Всё остальное — по желанию. 💚",
         parse_mode="HTML"
@@ -1192,11 +1149,8 @@ async def show_help(message: Message):
 
 # === ЕЖЕДНЕВНЫЕ АФФИРМАЦИИ ===
 async def _send_affirmations(bot: Bot, prefix: str, log_label: str):
-    now = datetime.utcnow()
-    users = await execute_query("SELECT user_id, silence_until FROM users")
+users = await execute_query("SELECT user_id FROM users")
     for user in users:
-        if user["silence_until"] and user["silence_until"] > now:
-            continue
         try:
             text = await get_unique_affirmation(user["user_id"])
             await bot.send_message(user["user_id"], f"{prefix}{text}")
@@ -1211,11 +1165,8 @@ async def send_morning_affirmations(bot: Bot):
 
 # === ВЕЧЕРНИЕ ВОПРОСЫ ===
 async def _send_evening_questions(bot: Bot, log_label: str):
-    now = datetime.utcnow()
-    users = await execute_query("SELECT user_id, silence_until FROM users")
+    users = await execute_query("SELECT user_id FROM users")
     for user in users:
-        if user["silence_until"] and user["silence_until"] > now:
-            continue
         try:
             question = await get_unique_question(user["user_id"])
             await bot.send_message(user["user_id"], f"🌙 {question}")
