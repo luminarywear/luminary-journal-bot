@@ -812,14 +812,20 @@ router = Router()
 def get_addressing(soft_name):
     return f"{soft_name}, " if soft_name else ""
 
-def get_main_menu():
+def get_main_menu(silence_enabled: bool = False):
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🌱 Добавить достижение")],
             [KeyboardButton(text="🤍 Добавить благодарность себе")],
             [KeyboardButton(text="✍️ Добавить запись")],
             [KeyboardButton(text="🌀 Режим «Здесь и Сейчас»")],
-            [KeyboardButton(text="🕊️ Режим тишины")],
+            [
+                KeyboardButton(
+                    text="🔔 Выйти из режима тишины"
+                    if silence_enabled
+                    else "🕊️ Режим тишины"
+                )
+            ],
             [KeyboardButton(text="Поддержать дыхание дневника 🌱")],
             [KeyboardButton(text="🌱 Мои достижения")],
             [KeyboardButton(text="🤍 Мои благодарности")],
@@ -828,14 +834,15 @@ def get_main_menu():
         resize_keyboard=True,
         one_time_keyboard=False
     )
-def silence_off_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔔 Выйти из режима тишины")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
+
+async def get_user_menu(user_id: int) -> ReplyKeyboardMarkup:
+    rows = await execute_query(
+        "SELECT silence_until FROM users WHERE user_id = $1",
+        user_id
     )
+    silence_until = rows[0]["silence_until"] if rows else None
+    silence_enabled = bool(silence_until and silence_until > datetime.utcnow())
+    return get_main_menu(silence_enabled=silence_enabled)
 
 # === START ===
 @router.message(F.text == "/start")
@@ -901,14 +908,14 @@ async def handle_name_input(message: Message, state: FSMContext):
                 f"{prefix}дневник открыт. 🌿\n\n"
                 "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
                 "Просто нажми на кнопку ниже.",
-                reply_markup=get_main_menu()
+                reply_markup=await get_user_menu(message.from_user.id)
             )
     else:
         await message.answer(
             f"{prefix}дневник открыт. 🌿\n\n"
             "Ты можешь добавлять сюда свои записи, достижения и благодарности.\n"
             "Просто нажми на кнопку ниже.",
-            reply_markup=get_main_menu()
+            reply_markup=await get_user_menu(message.from_user.id)
         )
 
 # === ДОБАВЛЕНИЕ ЗАПИСЕЙ ===
@@ -926,7 +933,10 @@ async def add_achievement_save(message: Message, state: FSMContext):
         message.from_user.id, text
     )
     await state.clear()
-    await message.answer("Достижение добавлено. 🌱", reply_markup=get_main_menu())
+    await message.answer(
+        "Достижение добавлено. 🌱",
+        reply_markup=await get_user_menu(message.from_user.id)
+    )
 
 @router.message(F.text == "🤍 Добавить благодарность себе")
 async def add_gratitude_start(message: Message, state: FSMContext):
@@ -941,7 +951,10 @@ async def add_gratitude_save(message: Message, state: FSMContext):
         message.from_user.id, text
     )
     await state.clear()
-    await message.answer("Благодарность добавлена. 🤍", reply_markup=get_main_menu())
+    await message.answer(
+        "Благодарность добавлена. 🤍",
+        reply_markup=await get_user_menu(message.from_user.id)
+    )
 
 @router.message(F.text == "✍️ Добавить запись")
 async def add_entry_start(message: Message, state: FSMContext):
@@ -956,7 +969,10 @@ async def add_entry_save(message: Message, state: FSMContext):
         message.from_user.id, text
     )
     await state.clear()
-    await message.answer("Записано. ✨", reply_markup=get_main_menu())
+   await message.answer(
+        "Записано. ✨",
+        reply_markup=await get_user_menu(message.from_user.id)
+    )
 
 # === ПРОСМОТР ЗАПИСЕЙ ===
 
@@ -1026,7 +1042,7 @@ async def delete_all_confirm(message: Message):
         "Все твои записи удалены. 🤍\n\n"
         "Если захочешь начать заново — просто напиши сюда.\n"
         "Дневник всегда открыт.",
-        reply_markup=get_main_menu()
+        reply_markup=await get_user_menu(message.from_user.id)
     )
 
 # === БЛАГОДАРНОСТЬ ===
@@ -1105,7 +1121,7 @@ async def enable_silence_button(message: Message):
 
     await message.answer(
         "🌙 Режим тишины включён",
-        reply_markup=silence_off_menu()
+        reply_markup=await get_user_menu(message.from_user.id)
     )
 
 @router.message(F.text == "🔔 Выйти из режима тишины")
@@ -1117,7 +1133,7 @@ async def disable_silence_button(message: Message):
 
     await message.answer(
         "✨ Режим тишины выключен",
-        reply_markup=get_main_menu()
+        reply_markup=await get_user_menu(message.from_user.id)
     )
 
 
